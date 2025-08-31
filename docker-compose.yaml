@@ -1,0 +1,183 @@
+# docker-compose.yml
+# Prototype a learnable KG stack with **LM Studio** as the LLM backend.
+# - You will RUN LM Studio on the HOST (Mac/Windows/Linux) and enable its local server.
+# - Containers call LM Studio at http://host.docker.internal:1234/v1 (works on Mac/Win; on Linux we map host-gateway).
+# - Stack: Neo4j (graph), Postgres+pgvector (vectors), KG-API (FastAPI), Agent-Gateway (tool facade), Scheduler (optional).
+# - Replace paths/commands to match your repo layout.
+
+
+
+x-lmstudio-host: &lmstudio_host
+  # Ensure containers can reach host LM Studio server at host.docker.internal
+  # On Linux, Docker 20.10+ supports host-gateway mapping:
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+x-common-env: &common_env
+  # Point all services that call an LLM to LM Studio's OpenAI-compatible endpoint.
+  # In LM Studio: "Start Server" → note the Port (default 1234) and set an API key (any string, e.g., "lm-studio").
+  LLM_BASE_URL: "http://host.docker.internal:1234/v1"
+  LLM_API_KEY: "lm-studio"
+
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j
+    environment:
+      # !!! CHANGE THIS PASSWORD !!!
+      NEO4J_AUTH: "neo4j/neo4j_password"
+      # Optional plugins, uncomment if you use apoc:
+      NEO4JLABS_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    ports:
+      - "7474:7474"   # HTTP UI
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      # Basic readiness: HTTP availability of Neo4j browser; switch to cypher-shell if you prefer
+      test: ["CMD", "wget", "-qO-", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  postgres:
+    # pgvector preinstalled
+    image: pgvector/pgvector:pg16
+    container_name: pgvector
+    environment:
+      POSTGRES_USER: "kg_user"          # !!! CHANGE USER/PASS !!!
+      POSTGRES_PASSWORD: "kg_password"
+      POSTGRES_DB: "kg_db"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kg_user -d kg_db || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # FastAPI microservice that fronts the KG (read/write paths, propose/approve/gaps)
+  kg-api:
+    image: python:3.11-slim
+    container_name: kg-api
+    <<: *lmstudio_host
+    working_dir: /app
+    volumes:
+      - ./services/kg-api:/app:rw
+    environment:
+      <<: *common_env
+      # Graph + Vector connections
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "neo4j_password"  # keep in .env in real use
+      PG_HOST: "postgres"
+      PG_PORT: "5432"
+      PG_USER: "kg_user"
+      PG_PASSWORD: "kg_password"
+      PG_DB: "kg_db"
+      # Optional: DSN form if your app uses it
+      PG_DSN: "postgresql://kg_user:kg_password@postgres:5432/kg_db"
+      # Policy toggles (example)
+      AUTO_MERGE_FIRST_PARTY: "true"
+      ENABLE_BACKGROUND_GAPS: "true"
+    # Install deps then run the API; replace with your app entrypoint
+    command: >
+      bash -lc "
+        pip install --no-cache-dir -r requirements.txt &&
+        uvicorn app:app --host 0.0.0.0 --port 8000
+      "
+    ports:
+      - "8000:8000"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Tool-facing proxy that the chat/agent hits; enforces policy and calls kg-api + LM Studio
+  agent-gateway:
+    image: python:3.11-slim
+    container_name: agent-gateway
+    <<: *lmstudio_host
+    working_dir: /app
+    volumes:
+      - ./services/agent-gateway:/app:rw
+    environment:
+      <<: *common_env
+      KG_API_URL: "http://kg-api:8000"
+      # Example gates
+      TIER_AUTO_TRUST_THRESHOLD: "0.85"
+      TIER_MIN_EVIDENCE_QUALITY: "0.7"
+    command: >
+      bash -lc "
+        pip install --no-cache-dir -r requirements.txt &&
+        uvicorn app:app --host 0.0.0.0 --port 7000
+      "
+    ports:
+      - "7000:7000"
+    depends_on:
+      kg-api:
+        condition: service_started
+    restart: unless-stopped
+
+  # Optional background scheduler for gap scans / research tasks (kept lightweight)
+  scheduler:
+    image: python:3.11-slim
+    container_name: kg-scheduler
+    <<: *lmstudio_host
+    working_dir: /app
+    volumes:
+      - ./services/scheduler:/app:rw
+    environment:
+      <<: *common_env
+      KG_API_URL: "http://kg-api:8000"
+      GATEWAY_URL: "http://agent-gateway:7000"
+      SCAN_INTERVAL_SECONDS: "600"
+    command: >
+      bash -lc "
+        pip install --no-cache-dir -r requirements.txt &&
+        uvicorn app:app --host 0.0.0.0 --port 7100
+      "
+    depends_on:
+      agent-gateway:
+        condition: service_started
+    restart: unless-stopped
+    # ports:
+    #   - "7100:7100"  # optional: expose /health
+
+
+
+
+
+
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  pg_data:
+
+
+# QUICKSTART (comments)
+# 1) Start LM Studio locally → Start Server (e.g., port 1234) → set API key "lm-studio".
+# 2) Save this file as docker-compose.yml at repo root. Create the service folders:
+#      mkdir -p services/kg-api services/agent-gateway services/scheduler
+#      # add your apps + requirements.txt in each
+# 3) Bring up core stack:
+#      docker compose up -d neo4j postgres kg-api agent-gateway
+#    (or everything incl. scheduler:)
+#      docker compose --profile research up -d
+# 4) Test:
+#      curl http://localhost:7000/health
+#      curl http://localhost:8000/health
+# 5) If containers can’t reach LM Studio:
+#      - Confirm LM Studio server is listening on localhost:1234.
+#      - On Linux: Docker must support "host-gateway" (20.10+). Otherwise, map your host IP instead of host.docker.internal.

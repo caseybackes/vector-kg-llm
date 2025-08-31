@@ -1,7 +1,7 @@
 ```mermaid
 graph LR
   subgraph compose
-    K["KG-API (FastAPI)"]
+    K["KG-API (FastAPI)"] 
     G["agent-gateway"]
     N["Neo4j"]
     P["Postgres + pgvector"]
