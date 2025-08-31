@@ -17,7 +17,7 @@ import os, json, re
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 
 from . import (
@@ -26,7 +26,7 @@ from . import (
     ALLOWED_READ_RELS, _ADD_RE, _NEI_RE, SYSTEM_PROMPT,
 )
 
-
+from .auth import require_key
 
 app = FastAPI(title="agent-gateway", version="0.1.0")
 
@@ -224,7 +224,7 @@ async def health() -> Dict[str, Any]:
 
 
 @app.post("/propose_claim")
-async def propose_claim(claim: ClaimIn) -> Dict[str, Any]:
+async def propose_claim(claim: ClaimIn, _=Depends(require_key)) -> Dict[str, Any]:
     """Policy gate:
        - If predicate ∈ AUTO_MERGE_PREDICATES, object_kind=='entity', trust≥AUTO_TRUST, MIN_QUAL satisfied, and no conflicts → approve
        - Else → pending
@@ -267,7 +267,7 @@ async def propose_claim(claim: ClaimIn) -> Dict[str, Any]:
 
 
 @app.post("/cypher")
-async def cypher(body: CypherBody) -> Dict[str, Any]:
+async def cypher(body: CypherBody, _=Depends(require_key)) -> Dict[str, Any]:
     """Pass-through helper to KG for ad-hoc queries (use sparingly)."""
     return await _kg_post("/cypher", body.model_dump())
 
@@ -293,7 +293,7 @@ async def llm_chat(messages: List[Dict[str, str]]) -> Dict[str, Any]:
 
 
 @app.post("/query")
-async def query(body: QueryIn) -> dict:
+async def query(body: QueryIn, _=Depends(require_key)) -> dict:
     messages = [
         {"role":"system","content": SYSTEM_PROMPT},
         {"role":"user","content": body.question},
