@@ -222,19 +222,15 @@ def cypher(body: CypherBody) -> Dict[str, Any]:
     return {"records": _neo4j_records_to_json(data)}
 
 
+# 2) neighbors query (no deprecated CALL subquery)
 @app.post("/neighbors")
 def neighbors(body: NeighborsBody) -> Dict[str, Any]:
-    """Depth-limited neighbors around an Entity id. Supports depth 1 or 2 (simple)."""
     if body.depth not in (1, 2):
         raise HTTPException(400, "depth must be 1 or 2")
     q = f"""
     MATCH (n:Entity {{id:$id}})
-    CALL {{
-      WITH n
-      MATCH p=(n)-[r*1..{body.depth}]-(m)
-      RETURN p LIMIT $limit
-    }}
-    RETURN p
+    MATCH p=(n)-[*1..{body.depth}]-(m)
+    RETURN p LIMIT $limit
     """
     return cypher(CypherBody(query=q, params={"id": body.id, "limit": body.limit}))
 
@@ -254,14 +250,13 @@ def propose_claim(claim: ClaimProposal) -> Dict[str, Any]:
         rec = tx.run(
             """
             CREATE (c:Claim {
-              id: apoc.create.uuid(),
-              subject_id:$s, predicate:$p, object_kind:$ok, object_value:$ov,
-              status:$st, model_conf:$mc, human_conf:$hc, context_hash:$ch,
-              who:$who, when:$when, prompt_hash:$ph, model_version:$mv,
-              git_sha:$git, image_digest:$img, run_id:$run, dataset_uri:$ds, sensor_id:$sid, frame_ts:$fts,
-              created_at: timestamp()
-            })
-            RETURN c
+            id: randomUUID(),
+            subject_id:$s, predicate:$p, object_kind:$ok, object_value:$ov,
+            status:$st, model_conf:$mc, human_conf:$hc, context_hash:$ch,
+            who:$who, when:$when, prompt_hash:$ph, model_version:$mv,
+            git_sha:$git, image_digest:$img, run_id:$run, dataset_uri:$ds, sensor_id:$sid, frame_ts:$fts,
+            created_at: timestamp()
+            }) RETURN c
             """,
             s=claim.subject_id, p=claim.predicate, ok=claim.object_kind, ov=claim.object_value,
             st=claim.status, mc=claim.model_conf, hc=claim.human_conf, ch=claim.context_hash,
@@ -283,9 +278,9 @@ def propose_claim(claim: ClaimProposal) -> Dict[str, Any]:
             tx.run(
                 """
                 CREATE (ev:Evidence {
-                  id: apoc.create.uuid(),
-                  uri_or_blob_ref:$u, snippet:$snip, hash:$h, source_type:$src,
-                  quality_score:$q, timestamp:$ts, created_at: timestamp()
+                id: randomUUID(),
+                uri_or_blob_ref:$u, snippet:$snip, hash:$h, source_type:$src,
+                quality_score:$q, timestamp:$ts, created_at: timestamp()
                 })
                 WITH ev
                 MATCH (c:Claim {id:$cid})

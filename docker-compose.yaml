@@ -18,6 +18,7 @@ x-common-env: &common_env
   # In LM Studio: "Start Server" → note the Port (default 1234) and set an API key (any string, e.g., "lm-studio").
   LLM_BASE_URL: "http://host.docker.internal:1234/v1"
   LLM_API_KEY: "lm-studio"
+  LLM_MODEL: "llama-3.2-1b-instruct"   # <-- set to whatever LM Studio lists
 
 services:
   neo4j:

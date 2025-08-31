@@ -13,29 +13,88 @@
 #   uvicorn app:app --host 0.0.0.0 --port 7000
 from __future__ import annotations
 
-import os
+import os, json, re
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+
+_NEI_RE = re.compile(r"neighbors.*`([^`]+)`.*depth\s+(\d+)", re.I)
+
 app = FastAPI(title="agent-gateway", version="0.1.0")
+LLM_MODEL = os.getenv("LLM_MODEL", "local")  # set this via compose to your loaded model's name
 
 KG_API_URL = os.getenv("KG_API_URL", "http://kg-api:8000")
+
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://host.docker.internal:1234/v1")
+
 LLM_API_KEY = os.getenv("LLM_API_KEY", "lm-studio")
 
 AUTO_TRUST = float(os.getenv("TIER_AUTO_TRUST_THRESHOLD", "0.85"))
+
 MIN_QUAL = float(os.getenv("TIER_MIN_EVIDENCE_QUALITY", "0.70"))
 
 AUTO_MERGE_PREDICATES = {"USES", "INGESTS", "PRODUCES"}  # tweak as needed
+
 FIRST_PARTY = {"first_party_log", "config", "run_artifact"}
+
+ALLOWED_READ_RELS = {"USES","INGESTS","PRODUCES","VERSION_OF","MENTIONS","FIXED_BY","ORIGINATES_AT"}
+_ADD_RE = re.compile(
+    r"Add a claim:\s*`?([^`\s]+)`?\s+([A-Z_]+)\s+`?([^`\s]+)`?.*?quality\s+([0-9.]+)",
+    re.I,
+)
+
+SYSTEM_PROMPT = """
+You are a tool-using assistant. Only respond with ONE JSON object per turn.
+SCHEMA:
+  {"tool":"neighbors","args":{"id":"<entity-id>","depth":1|2,"limit":<int>}}
+  {"tool":"cypher","args":{"query":"<READ-ONLY CYPHER>","params":{"id":"<id>","id2":"<id2>"}}}
+  {"tool":"propose_claim","args":{
+      "subject_id":"<id>","predicate":"<RELATION>",
+      "object_kind":"entity|literal","object_value":"<id-or-literal>",
+      "model_conf":<0..1>,
+      "evidence":[{"uri_or_blob_ref":"<uri>","source_type":"first_party_log|config|run_artifact|internal_doc|web|llm_self","quality_score":<0..1>}],
+      "provenance":{"who":"<agent>", "when":<epoch>}
+  }}
+  OR {"final":{"answer":"<text>","citations":[...]}}
+RULES:
+- Entities are identified by property **id** (NOT name).
+- Prefer **neighbors** for “list neighbors … depth N”.
+- If using **cypher**, it must be READ-ONLY and only these rel types: """ + ",".join(sorted(ALLOWED_READ_RELS)) + """
+  Use parameters (e.g., MATCH (e:Entity {id:$id}) ...).
+- Use **propose_claim** ONLY when the user explicitly asks to add/update knowledge.
+- If required fields are missing, return {"final":{"answer":"ask user for <field>"}}.
+EXAMPLES:
+1) Q: "List neighbors of Entity `Run:demo` depth 1."
+   A: {"tool":"neighbors","args":{"id":"Run:demo","depth":1,"limit":50}}
+2) Q: "Find path up to 2 hops between `A` and `B`."
+   A: {"tool":"cypher","args":{"query":"MATCH p=shortestPath((:Entity {id:$id})-[:USES|INGESTS|PRODUCES*..2]-(:Entity {id:$id2})) RETURN p","params":{"id":"A","id2":"B"}}}
+3) Q: "Add claim: Run:demo USES Model:v2 (first-party, qual=0.95)."
+   A: {"tool":"propose_claim","args":{
+         "subject_id":"Run:demo","predicate":"USES","object_kind":"entity","object_value":"Model:v2",
+         "model_conf":0.9,
+         "evidence":[{"uri_or_blob_ref":"log://run/demo","source_type":"first_party_log","quality_score":0.95}],
+         "provenance":{"who":"gateway","when":1690000000}
+      }}
+"""
+
+
+
+
+
+
 
 
 # ------------------------
 # Models
 # ------------------------
+
+class QueryIn(BaseModel):
+    question: str
+    max_steps: int = 4
+
 
 class Evidence(BaseModel):
     uri_or_blob_ref: str
@@ -123,6 +182,87 @@ async def _has_conflicts(claim: ClaimIn) -> bool:
         # On failure, be conservative: route to review
         return True
 
+async def _call_llm(messages: list[dict]) -> str:
+    """Call LM Studio (OpenAI-compatible). Avoid features some models 400 on."""
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    payload = {
+        "model": LLM_MODEL,        # e.g. "TheBloke/Mistral-7B…", "qwen2.5:7b", etc.
+        "messages": messages,
+        "temperature": 0.1,
+        "stream": False,
+        # DO NOT send response_format/tools to keep it broadly compatible
+    }
+    async with httpx.AsyncClient(base_url=LLM_BASE_URL, headers=headers, timeout=60.0) as client:
+        r = await client.post("/chat/completions", json=payload)
+        r.raise_for_status()  # will 400 if LM Studio rejects payload
+        return r.json()["choices"][0]["message"]["content"]
+
+
+def _extract_json(s: str) -> dict:
+    """Extract first JSON object. If none, coerce to final answer.
+    Also strips wrappers some LLMs add like [TOOL_RESULT]..."""
+    s = re.sub(r'^\s*\[TOOL_RESULT\]\s*', '', s)
+    s = re.sub(r'\s*\[END_TOOL_RESULT\]\s*$', '', s)
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {"final": {"answer": s.strip() or ""}}
+
+async def _dispatch_tool(req: dict) -> dict:
+    """Map tool calls to kg-api endpoints."""
+    tool = req.get("tool")
+    args = req.get("args", {})
+    if tool == "cypher":
+        q = args.get("query","")
+        if not _cypher_safe(q):
+            raise HTTPException(400, f"Rejected unsafe/unknown Cypher: {q[:120]}")
+    if tool == "neighbors":
+        # args: {"id": "Entity:123", "depth": 1, "limit": 50}
+        return await _kg_post("/neighbors", args)
+
+    if tool == "propose_claim":
+        # args must match kg-api ClaimProposal (object_kind in {"entity","literal"})
+        return await _kg_post("/propose_claim", args)
+    if tool == "cypher":
+        return await _kg_post("/cypher", args)
+    raise HTTPException(400, f"Unknown tool: {tool}")
+
+def _maybe_route_neighbors(q: str) -> dict | None:
+    m = _NEI_RE.search(q)
+    if not m:
+        return None
+    ent, depth = m.group(1), max(1, min(2, int(m.group(2))))
+    return {"tool":"neighbors","args":{"id":ent,"depth":depth,"limit":50}}
+
+def _cypher_safe(query: str) -> bool:
+    bad = ["name:", "HAS_KNOWLEDGE", "CREATE ", "MERGE ", "DELETE ", "SET "]
+    return not any(b in query for b in bad)
+
+def _maybe_route_add_claim(q: str) -> dict | None:
+    m = _ADD_RE.search(q)
+    if not m:
+        return None
+    subj, pred, obj, qual = m.groups()
+    return {
+        "tool": "propose_claim",
+        "args": {
+            "subject_id": subj,
+            "predicate": pred.upper(),
+            "object_kind": "entity",
+            "object_value": obj,
+            "model_conf": 0.9,
+            "evidence": [{
+                "uri_or_blob_ref": f"log://{subj}",
+                "source_type": "first_party_log",
+                "quality_score": float(qual),
+            }],
+            "provenance": {"who": "gateway", "when": __import__("time").time()}
+        }
+    }
+
 
 # ------------------------
 # Endpoints
@@ -201,3 +341,47 @@ async def llm_chat(messages: List[Dict[str, str]]) -> Dict[str, Any]:
         r.raise_for_status()
         data = r.json()
         return {"text": data["choices"][0]["message"]["content"], "raw": data}
+
+
+@app.post("/query")
+async def query(body: QueryIn) -> dict:
+    messages = [
+        {"role":"system","content": SYSTEM_PROMPT},
+        {"role":"user","content": body.question},
+    ]
+    trace = []
+
+    routed_add = _maybe_route_add_claim(body.question)
+    if routed_add:
+        result = await _dispatch_tool(routed_add)
+        return {"ok": True, "answer": "", "trace": [{"assistant": json.dumps(routed_add)}, {"tool_result": result}]}
+
+
+    # fast-path router for common asks
+    routed = _maybe_route_neighbors(body.question)
+    if routed:
+        result = await _dispatch_tool(routed)
+        trace += [{"assistant": json.dumps(routed)}, {"tool_result": result}]
+        # give model one chance to summarize with a final
+        messages += [{"role":"assistant","content": json.dumps(routed)},
+                    {"role":"tool","content": json.dumps(result)}]
+        assistant_text = await _call_llm(messages)
+        trace.append({"assistant": assistant_text})
+        obj = _extract_json(assistant_text)
+        if "final" in obj:
+            return {"ok": True, "answer": obj["final"].get("answer",""), "trace": trace}
+        # if not finalized, just return the tool result
+        return {"ok": True, "answer": "", "trace": trace, "data": result}
+
+    # normal loop...
+    for _ in range(max(1, body.max_steps)):
+        assistant_text = await _call_llm(messages)
+        trace.append({"assistant": assistant_text})
+        obj = _extract_json(assistant_text)
+        if "final" in obj:
+            return {"ok": True, "answer": obj["final"].get("answer",""), "trace": trace}
+        result = await _dispatch_tool(obj)
+        trace.append({"tool_result": result})
+        messages += [{"role":"assistant","content": assistant_text},
+                     {"role":"tool","content": json.dumps(result)}]
+    return {"ok": True, "answer":"(stopped: max_steps)", "trace": trace}
