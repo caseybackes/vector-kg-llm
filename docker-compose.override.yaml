@@ -3,8 +3,11 @@
 
 services:
   agent-gateway:
+    env_file: [.env]
     environment:
       GATEWAY_API_KEY: "${GATEWAY_API_KEY}"
+      KG_API_URL: "http://kg-api:8000"
+
     deploy:
       resources:
         limits:
@@ -20,6 +23,7 @@ services:
     restart: unless-stopped
 
   kg-api:
+    env_file: [.env]
     deploy:
       resources:
         limits:
@@ -55,3 +59,16 @@ services:
       options:
         max-size: "25m"
         max-file: "3"
+  neo4j-init:
+    image: neo4j:5-community
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD:-neo4j_password}"
+    volumes:
+      - ./init/neo4j:/init:ro
+    entrypoint: >
+      bash -lc "cypher-shell -a bolt://neo4j:7687 -u neo4j -p ${NEO4J_PASSWORD}
+      -f /init/constraints.cypher && echo 'neo4j constraints applied'"
+    restart: "no"
