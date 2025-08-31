@@ -1,0 +1,57 @@
+# docker-compose.override.yml
+# "Home production" hardening without overkill: resources, restart, logging, auth envs.
+
+services:
+  agent-gateway:
+    environment:
+      GATEWAY_API_KEY: "${GATEWAY_API_KEY}"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
+    ulimits:
+      nofile: 65535
+    restart: unless-stopped
+
+  kg-api:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
+    restart: unless-stopped
+
+  neo4j:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
+
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
