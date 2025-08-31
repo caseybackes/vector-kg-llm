@@ -21,19 +21,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from . import (
-    LLM_MODEL,
-    LLM_API_KEY,
-    LLM_MODEL,
-    KG_API_URL,
-    LLM_BASE_URL,
-    AUTO_TRUST, 
-    MIN_QUAL,
-    AUTO_MERGE_PREDICATES,
-    FIRST_PARTY,
-    ALLOWED_READ_RELS,
-    _ADD_RE,
-    _NEI_RE
+    LLM_MODEL, LLM_API_KEY, KG_API_URL, LLM_BASE_URL,
+    AUTO_TRUST, MIN_QUAL, AUTO_MERGE_PREDICATES, FIRST_PARTY,
+    ALLOWED_READ_RELS, _ADD_RE, _NEI_RE, SYSTEM_PROMPT,
 )
+
 
 
 app = FastAPI(title="agent-gateway", version="0.1.0")
@@ -280,12 +272,15 @@ async def cypher(body: CypherBody) -> Dict[str, Any]:
     return await _kg_post("/cypher", body.model_dump())
 
 
-# Optional LLM passthrough (LM Studio). Keep simple; you can wire this into /query later.
 @app.post("/llm_chat")
 async def llm_chat(messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    Minimal LM Studio passthrough. Use the actual model id from __init__.py (LLM_MODEL);
+    keeps payload minimal for widest compatibility.
+    """
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
     payload = {
-        "model": "local-model",  # LM Studio ignores name by default; set your loaded model name if needed
+        "model": LLM_MODEL,      # <- was hardcoded "local-model"
         "messages": messages,
         "temperature": 0.2,
         "stream": False,

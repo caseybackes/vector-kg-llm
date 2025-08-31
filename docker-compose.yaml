@@ -121,7 +121,7 @@ services:
     command: >
       bash -lc "
         pip install --no-cache-dir -r requirements.txt &&
-        uvicorn app:app --host 0.0.0.0 --port 7000
+        uvicorn gateway.app:app --host 0.0.0.0 --port 7000
       "
     ports:
       - "7000:7000"
