@@ -9,23 +9,25 @@ participant GW as "agent-gateway (policy)"
 participant API as "kg-api"
 participant GDB as "GraphDB"
 participant VDB as "VectorDB"
-participant UI as "Review UI (optional)"
+participant UI as "Review UI"
 
-User->>Agent: Provide info / confirm intent
-Agent->>GW: tool.propose_claim(Claim,Evidence,Provenance)
-GW->>API: /propose (dedup + conflict check)
-API->>GDB: upsert Claim/Evidence (status=pending|auto)
-API->>VDB: index snippets (for dedup/search)
-API-->>GW: {conflicts, trust_score}
+User->>Agent: provide info / confirm intent
+Agent->>GW: propose_claim (claim, evidence, prov)
+GW->>API: propose (dedup + conflict check)
+API->>GDB: upsert claim and evidence
+API->>VDB: index snippets
+API-->>GW: conflicts and trust_score
 
-alt Auto-merge (first-party, no conflicts, high trust)
-  GW->>API: /materialize_edges(Claim.id)
-  API->>GDB: set Claim.status=approved; create edges
-  API->>VDB: re-embed impacted nodes/text
-else Human review (default)
+alt auto-merge (first-party, no conflicts, high trust)
+  GW->>API: materialize_edges (claim_id)
+  API->>GDB: set claim.status = approved
+  API->>GDB: create edges
+  API->>VDB: re-embed affected text
+else human review (default)
   GW->>UI: enqueue review card
-  UI->>API: approve/reject
-  API->>GDB: apply decision (edges or close)
+  UI->>API: approve or reject
+  API->>GDB: apply decision
 end
+
 
 ``` 
